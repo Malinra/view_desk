@@ -1,0 +1,62 @@
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+*.env.local
+*.pem
+*.key
+*.crt
+
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# Virtual Environments & Packages
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Runtime Logs, PIDs, State
+# ==========================================
+*.log
+*.pid
+service.log
+server.log
+app.pid
+
+# ==========================================
+# Temporary Files & OS Specific
+# ==========================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

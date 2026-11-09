@@ -1,0 +1,22 @@
+<user-mapping>
+    <!-- Web 端登录凭据（可在此设置任意账号密码） -->
+    <authorize username="charlie" password="password">
+        <connection name="真实服务器桌面 (Ubuntu 24.04)">
+            <protocol>rdp</protocol>
+            <!-- 连接宿主机 3389 真实桌面服务 -->
+            <param name="hostname">host.docker.internal</param>
+            <param name="port">3389</param>
+            <param name="username">your_username</param>
+            <param name="password">your_password</param>
+            <!-- 忽略内网自签证书 -->
+            <param name="ignore-cert">true</param>
+            <!-- 核心自适应分辨率 -->
+            <param name="resize-method">display-update</param>
+            <param name="enable-wallpaper">true</param>
+            <param name="enable-theming">true</param>
+            <param name="enable-font-smoothing">true</param>
+            <param name="enable-full-window-drag">true</param>
+            <param name="color-depth">24</param>
+        </connection>
+    </authorize>
+</user-mapping>

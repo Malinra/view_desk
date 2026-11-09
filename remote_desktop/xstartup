@@ -1,0 +1,21 @@
+#!/bin/bash
+unset SESSION_MANAGER
+
+# 获取当前虚拟屏幕编号
+export DISPLAY="${DISPLAY:-:10}"
+
+# 屏蔽自启动目录，防止向日葵被拉起
+EMPTY_AUTOSTART=/tmp/novnc_empty_autostart
+mkdir -p "$EMPTY_AUTOSTART"
+
+export XKL_XMODMAP_DISABLE=1
+export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+export GNOME_SHELL_SESSION_MODE=ubuntu
+export XDG_SESSION_TYPE=x11
+
+# 启动独立的 dbus 会话总线，并把虚拟 DISPLAY 注册到当前 dbus 会话
+# 这样所有在远程桌面里点击启动的软件，都会强制渲染在当前的虚拟屏幕上，而不会跑去物理屏幕
+exec dbus-run-session -- bash -c '
+    dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+    exec gnome-session --session=ubuntu --autostart="'"$EMPTY_AUTOSTART"'" --disable-acceleration-check
+'

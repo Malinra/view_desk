@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <title>远程桌面 – {{ username }}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden;
+                 background: #111; font-family: system-ui, sans-serif; }
+
+    /* ── 顶栏 ── */
+    #topbar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      height: 36px;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(8px);
+      display: flex; align-items: center; padding: 0 12px;
+      gap: 10px;
+      transition: opacity .3s;
+    }
+    #topbar:hover { opacity: 1 !important; }
+    #topbar.hidden { opacity: 0; pointer-events: none; }
+    .bar-title { color: rgba(255,255,255,0.7); font-size: 13px; flex: 1; }
+    .bar-btn {
+      padding: 4px 12px; border-radius: 6px; border: none; cursor: pointer;
+      font-size: 12px; font-weight: 600;
+    }
+    #btnFullscreen { background: #0288d1; color: #fff; }
+    #btnClipboard  { background: #37474f; color: #ccc; }
+    #btnLogout     { background: #c62828; color: #fff; }
+
+    /* ── 状态覆盖层 ── */
+    #overlay {
+      position: fixed; inset: 0; z-index: 200;
+      background: #111;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 18px;
+    }
+    #overlay.hidden { display: none; }
+    .spinner-ring {
+      width: 52px; height: 52px;
+      border: 4px solid rgba(255,255,255,0.1);
+      border-top-color: #4fc3f7;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #statusMsg { color: rgba(255,255,255,0.65); font-size: 15px; }
+    #errorMsg  { color: #ef9a9a; font-size: 14px; display: none; }
+
+    /* ── noVNC canvas 容器 ── */
+    #vnc-container {
+      position: fixed;
+      top: 36px; left: 0; right: 0; bottom: 0;
+      overflow: hidden;
+    }
+    /* noVNC 自己管理 canvas，我们只需给它一个全尺寸容器 */
+    #vnc-container canvas {
+      display: block;
+    }
+
+    /* ── 剪贴板面板 ── */
+    #clipPanel {
+      display: none;
+      position: fixed; top: 44px; right: 10px; z-index: 150;
+      background: #263238; border: 1px solid #37474f; border-radius: 8px;
+      padding: 10px; width: 280px;
+    }
+    #clipPanel textarea {
+      width: 100%; height: 80px; background: #1c262b; color: #cfd8dc;
+      border: 1px solid #455a64; border-radius: 4px; resize: vertical;
+      font-size: 13px; padding: 6px;
+    }
+    #clipPanel .row { display: flex; gap: 6px; margin-top: 6px; }
+    #clipPanel button {
+      flex: 1; padding: 5px; background: #0288d1; color: #fff;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- 连接状态覆盖层 -->
+<div id="overlay">
+  <div class="spinner-ring"></div>
+  <div id="statusMsg">正在连接桌面，请稍候…</div>
+  <div id="errorMsg"></div>
+</div>
+
+<!-- 顶部工具栏 -->
+<div id="topbar">
+  <span class="bar-title">🖥 远程桌面 &mdash; <strong>{{ username }}</strong></span>
+  <button class="bar-btn" id="btnClipboard">📋 剪贴板</button>
+  <button class="bar-btn" id="btnFullscreen">⛶ 全屏</button>
+  <a href="/logout"><button class="bar-btn" id="btnLogout">断开</button></a>
+</div>
+
+<!-- 剪贴板面板 -->
+<div id="clipPanel">
+  <textarea id="clipText" placeholder="在此粘贴文字，然后点击「发送」发送到远程桌面"></textarea>
+  <div class="row">
+    <button id="btnClipSend">发送到远程</button>
+    <button id="btnClipRecv">从远程接收</button>
+  </div>
+</div>
+
+<!-- noVNC 渲染区域 -->
+<div id="vnc-container"></div>
+
+<!-- noVNC 核心库 -->
+<script type="module">
+import RFB from '/novnc_ws/core/rfb.js';
+
+const WS_PORT  = {{ ws_port }};
+const VNC_PASS = "{{ vnc_pass }}";
+const host     = window.location.hostname;
+const wsUrl    = `ws://${host}:${WS_PORT}/websockify`;
+
+let rfb;
+
+function showError(msg) {
+  document.getElementById('statusMsg').style.display = 'none';
+  const e = document.getElementById('errorMsg');
+  e.textContent = '⚠ ' + msg;
+  e.style.display = 'block';
+}
+
+function connect() {
+  const container = document.getElementById('vnc-container');
+
+  rfb = new RFB(container, wsUrl, {
+    credentials: { password: VNC_PASS },
+    // 自动等比缩放贴合浏览器屏幕，实现自适应分辨率
+    scaleViewport: true,
+    resizeSession: false,
+    clipViewport: false,
+    shared: true,
+  });
+
+  rfb.addEventListener('connect', () => {
+    document.getElementById('overlay').classList.add('hidden');
+    // 自动隐藏顶栏（鼠标移近时显示）
+    setTimeout(() => {
+      document.getElementById('topbar').classList.add('hidden');
+    }, 3000);
+    // 发送当前视口尺寸
+    sendViewportSize();
+    // 保持会话活跃
+    setInterval(() => fetch('/api/keepalive', {method:'POST'}), 60000);
+  });
+
+  rfb.addEventListener('disconnect', (e) => {
+    document.getElementById('overlay').classList.remove('hidden');
+    if (e.detail.clean) {
+      showError('桌面会话已断开');
+    } else {
+      showError('连接意外中断，请刷新页面重试');
+    }
+  });
+
+  rfb.addEventListener('credentialsrequired', () => {
+    rfb.sendCredentials({ password: VNC_PASS });
+  });
+}
+
+// 通知 noVNC 视口大小改变（实现自适应分辨率）
+function sendViewportSize() {
+  if (!rfb) return;
+  const container = document.getElementById('vnc-container');
+  rfb.scaleViewport = true;
+  rfb.resizeSession = true;
+}
+
+window.addEventListener('resize', sendViewportSize);
+
+// ── 全屏 ──
+document.getElementById('btnFullscreen').addEventListener('click', () => {
+  const el = document.getElementById('vnc-container');
+  if (!document.fullscreenElement) {
+    el.requestFullscreen().catch(() => document.documentElement.requestFullscreen());
+  } else {
+    document.exitFullscreen();
+  }
+});
+
+// ── 剪贴板面板 ──
+document.getElementById('btnClipboard').addEventListener('click', () => {
+  const p = document.getElementById('clipPanel');
+  p.style.display = p.style.display === 'block' ? 'none' : 'block';
+});
+document.getElementById('btnClipSend').addEventListener('click', () => {
+  const text = document.getElementById('clipText').value;
+  if (rfb && text) rfb.clipboardPasteFrom(text);
+});
+document.getElementById('btnClipRecv').addEventListener('click', () => {
+  // noVNC 触发 clipboard 事件时填充
+  if (rfb) rfb.addEventListener('clipboard', (e) => {
+    document.getElementById('clipText').value = e.detail.text;
+  });
+});
+
+// 自动隐藏顶栏：靠近屏幕顶部时显示
+document.addEventListener('mousemove', (e) => {
+  const bar = document.getElementById('topbar');
+  if (e.clientY < 50) bar.classList.remove('hidden');
+  else setTimeout(() => bar.classList.add('hidden'), 2000);
+});
+
+// 开始连接
+connect();
+</script>
+</body>
+</html>

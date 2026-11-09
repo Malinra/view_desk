@@ -1,0 +1,24 @@
+version: '3'
+services:
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: guacd
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    container_name: guacamole
+    restart: unless-stopped
+    depends_on:
+      - guacd
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: 4822
+    volumes:
+      - ./guac_home:/home/guacamole/.guacamole
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

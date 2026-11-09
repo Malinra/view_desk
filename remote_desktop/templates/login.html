@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>远程桌面登录</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    .card {
+      background: rgba(255,255,255,0.05);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 16px;
+      padding: 48px 40px;
+      width: 380px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    .logo svg { width: 56px; height: 56px; }
+    h1 {
+      color: #fff;
+      font-size: 22px;
+      font-weight: 600;
+      text-align: center;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      color: rgba(255,255,255,0.45);
+      font-size: 13px;
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    label {
+      display: block;
+      color: rgba(255,255,255,0.7);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+    input[type=text], input[type=password] {
+      width: 100%;
+      padding: 12px 14px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 15px;
+      outline: none;
+      transition: border-color .2s;
+      margin-bottom: 20px;
+    }
+    input:focus { border-color: #4fc3f7; }
+    input::placeholder { color: rgba(255,255,255,0.3); }
+    button {
+      width: 100%;
+      padding: 13px;
+      background: linear-gradient(90deg, #0288d1, #26c6da);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+    }
+    button:hover { opacity: .9; }
+    button:active { transform: scale(.98); }
+    .error {
+      background: rgba(239,83,80,.15);
+      border: 1px solid rgba(239,83,80,.4);
+      color: #ef9a9a;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .spinner { display: none; }
+    button.loading .label { display: none; }
+    button.loading .spinner { display: inline; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <svg viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="56" height="56" rx="12" fill="#0288d1" fill-opacity=".2"/>
+      <rect x="10" y="14" width="36" height="24" rx="3" stroke="#4fc3f7" stroke-width="2"/>
+      <rect x="22" y="38" width="12" height="4" fill="#4fc3f7" opacity=".6"/>
+      <rect x="17" y="42" width="22" height="2" rx="1" fill="#4fc3f7" opacity=".4"/>
+      <circle cx="28" cy="26" r="5" stroke="#4fc3f7" stroke-width="2"/>
+      <path d="M24 30l-3 3M32 30l3 3" stroke="#4fc3f7" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+  </div>
+  <h1>远程桌面访问</h1>
+  <p class="subtitle">输入服务器账号密码以连接桌面</p>
+
+  {% if error %}
+  <div class="error">⚠ {{ error }}</div>
+  {% endif %}
+
+  <form method="POST" action="/login" id="loginForm">
+    <label for="username">用户名</label>
+    <input type="text" id="username" name="username" placeholder="Linux 用户名"
+           value="{{ request.form.get('username','') }}" autocomplete="username" required/>
+    <label for="password">密码</label>
+    <input type="password" id="password" name="password" placeholder="••••••••"
+           autocomplete="current-password" required/>
+    <button type="submit" id="btn">
+      <span class="label">登 录 →</span>
+      <span class="spinner">连接中…</span>
+    </button>
+  </form>
+</div>
+<script>
+  document.getElementById('loginForm').addEventListener('submit', function(){
+    document.getElementById('btn').classList.add('loading');
+  });
+</script>
+</body>
+</html>
