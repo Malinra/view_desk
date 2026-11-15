@@ -45,6 +45,7 @@ venv.bak/
 # Runtime Logs, PIDs, State
 # ==========================================
 *.log
+*.log.*
 *.pid
 service.log
 server.log

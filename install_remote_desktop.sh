@@ -20,7 +20,7 @@ echo "==================="
 
 # 1. Install required packages
 sudo apt update
-sudo apt install -y tigervnc-standalone-server tigervnc-common python3-pip python3-venv nginx
+sudo apt install -y tigervnc-standalone-server tigervnc-common python3-pip python3-venv python3-tk nginx
 
 # 2. Install noVNC (web client)
 NO_VNC_DIR="/opt/novnc"

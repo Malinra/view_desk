@@ -14,21 +14,48 @@ LOG_FILE="$PROJECT_DIR/service.log"
 PORT="${PORT:-5000}"
 
 # 1. 动态探测 Python 执行环境
-if [ -n "${PYTHON_BIN:-}" ] && [ -x "$PYTHON_BIN" ]; then
-    : # 使用指定环境变量
-elif [ -f "$PROJECT_DIR/venv/bin/python3" ]; then
-    PYTHON_BIN="$PROJECT_DIR/venv/bin/python3"
-elif [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/bin/python3" ]; then
-    PYTHON_BIN="$CONDA_PREFIX/bin/python3"
-elif [ -f "$HOME/miniconda3/bin/python3" ]; then
-    PYTHON_BIN="$HOME/miniconda3/bin/python3"
-    export PATH="$HOME/miniconda3/bin:$PATH"
-elif command -v python3 &>/dev/null; then
-    PYTHON_BIN="$(command -v python3)"
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] 未找到可用的 Python3 环境" >> "$LOG_FILE"
+#    必须验证 Flask / pam 依赖，不能只判断解释器是否存在。
+python_has_deps() {
+    "$1" -c 'import flask, pam' >/dev/null 2>&1
+}
+
+pick_python() {
+    local candidates=()
+    local py
+    if [ -n "${PYTHON_BIN:-}" ]; then
+        candidates+=("$PYTHON_BIN")
+    fi
+    if [ -f "$PROJECT_DIR/venv/bin/python3" ]; then
+        candidates+=("$PROJECT_DIR/venv/bin/python3")
+    fi
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/bin/python3" ]; then
+        candidates+=("$CONDA_PREFIX/bin/python3")
+    fi
+    if [ -f "$HOME/miniconda3/bin/python3" ]; then
+        candidates+=("$HOME/miniconda3/bin/python3")
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        candidates+=("$(command -v python3)")
+    fi
+
+    for py in "${candidates[@]}"; do
+        if [ -x "$py" ] && python_has_deps "$py"; then
+            PYTHON_BIN="$py"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! pick_python; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] 未找到已安装 Flask / python-pam 的 Python 环境" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] 请执行: $PROJECT_DIR/venv/bin/pip install -r $PROJECT_DIR/requirements.txt" >> "$LOG_FILE"
     exit 1
 fi
+case "$PYTHON_BIN" in
+    "$HOME/miniconda3/bin/python3"|"$HOME"/miniconda3/envs/*/bin/python3)
+        export PATH="$(dirname "$PYTHON_BIN"):$PATH" ;;
+esac
 
 export PYTHONUNBUFFERED=1
 

@@ -18,6 +18,7 @@
 - 🔐 **系统原生 PAM 鉴权**：直接使用 Linux 系统账号登录，无需维护多套独立账号密码体系；支持 Shadow 回退。
 - ⚡ **动态按需分配与回收**：按需拉起 VNC 与 Websockify 代理端口，会话空闲自动超时释放，不浪费 GPU/CPU 算力。
 - 🛡️ **高安全隔离**：底层 VNC 端口仅绑定本地回环（`127.0.0.1`），杜绝直接暴露公网被端口扫描与暴力破解。
+- 📋 **双向剪贴板同步**：浏览器与远程桌面之间可直接复制粘贴文本；内置 X11 剪贴板桥，兼容不支持 RFB 剪贴板的 `x0vncserver`。
 - 🔄 **高可用守护体系**：内置精准 PID + 端口双重探测保活脚本（`keepalive_daemon.sh`）与无损平滑重启机制。
 - 📦 **双轨制架构**：同时提供**原生轻量级方案**（Flask + noVNC）与**企业级容器方案**（Apache Guacamole + RDP/Docker）。
 
@@ -38,6 +39,8 @@ flowchart TD
         VNC --> RealDesk[真实屏幕 :0 / 虚拟 X 桌面]
         WS <-->|RFB over WebSocket| User
         WS <-->|TCP Socket| VNC
+        Flask <-->|/api/clipboard| ClipBridge[Tk X11 剪贴板桥]
+        ClipBridge <-->|X11 CLIPBOARD| RealDesk
     end
 
     subgraph Guacamole Architecture [方案 B: 企业级容器架构]
@@ -93,6 +96,23 @@ http://<服务器IP>:5000
 ```
 输入当前 Linux 系统的账号与密码即可直接进入桌面。
 
+#### 4. 双向剪贴板同步
+
+登录后使用顶部工具栏的「📋 剪贴板」按钮：
+
+- **本机 → 远程**：在远程桌面窗口中按 `Ctrl+V`。页面会先读取本机剪贴板，写入远程 X11 的 `CLIPBOARD`，再向远程发送 `Ctrl+V`，因此不会粘贴成旧内容。也可以打开「📋」面板，把文字粘贴到文本框后点「发送到远程」（面板内粘贴会自动发送）。
+- **远程 → 本机**：在远程应用中复制（一般应用 `Ctrl+C`，终端 `Ctrl+Shift+C`）。通过 HTTPS（且 WebSocket 走 WSS）访问时会自动写入本机剪贴板；HTTP 下会利用“远程复制”动作带来的浏览器手势窗口，通常也能在 1 秒内自动同步，超出窗口时再点击「📋」按钮或提示条里的「复制到本机」取回。
+
+实现原理：`remote_desktop/clipboard_bridge.py` 在服务器端运行一个 Tk 守护进程，直接读写真实桌面 `:0` 的 X11 `CLIPBOARD`，再通过 Flask 的 `/api/clipboard` 与浏览器双向同步。它不依赖 `xclip` / `xsel`，也不要求 VNC 服务端支持 RFB 剪贴板（TigerVNC 1.13 的 `x0vncserver` 就不支持）。
+
+> **浏览器安全限制**：只有 HTTPS 或 `localhost` 页面才允许网页随意读写系统剪贴板。HTTP 访问时，远程复制后的几秒内仍可借助用户手势自动写入；如果手势已过期（例如剪贴板由后台程序修改），远程 → 本机就退化为点一次按钮。本机 → 远程的 `Ctrl+V` 同步不受影响。
+>
+> **首次打开页面**时只把远程剪贴板内容显示在面板中，不会覆盖本机原有剪贴板；点一下「复制远程内容」即可取回。之后的远程复制才会自动同步。
+>
+> **支持范围**：仅文本，单次上限 1 MB；图片、文件列表暂不支持（可参考 PRD 的后续路线图）。
+
+剪贴板异常时请查看 `remote_desktop/clipboard_bridge.log`，并确认系统已安装 `python3-tk`、当前只有一个剪贴板桥进程。
+
 ---
 
 ### 方案 B：Apache Guacamole 容器方案 (企业级)
@@ -129,6 +149,7 @@ http://<服务器IP>:8080/guacamole/
 | `remote_desktop/start.sh` | 自动探测执行环境并前台启动 Web 网关 |
 | `remote_desktop/restart.sh` | 精准探测端口占用，平滑重启网关进程，绝不误伤其他服务 |
 | `remote_desktop/keepalive_daemon.sh` | 端口与 PID 双重存活探测，适合配置于 Cron 定时任务实现自动拉起 |
+| `remote_desktop/clipboard_bridge.py` | X11 剪贴板桥守护进程，由 `app.py` 自动拉起，无需手动运行 |
 | `install_remote_desktop.sh` | 自动化安装系统依赖、初始化虚拟环境、配置 Systemd 与 NGINX |
 
 #### 配置 Cron 定时保活（可选）
@@ -146,6 +167,7 @@ crontab -e
 1. **配置 Nginx + HTTPS**：生产环境中强烈推荐通过 NGINX 配置 SSL 证书并开启 HTTPS/WSS 访问，防止局域网内密码被监听。
 2. **凭证脱敏**：上传代码或交付时，确认敏感密码已由 `.env.example` 和 `user-mapping.xml.example` 占位，避免泄露真实凭据。
 3. **防火墙配置**：仅开放 Web 端口（如 `5000` 或 `80/443`），无需对外开放 `5900+` 的 VNC 端口。
+4. **剪贴板权限**：剪贴板桥会读取真实桌面 `:0` 的 X11 `CLIPBOARD` 并提供给已登录的 Web 会话。能够登录 Web 网关的账号即可看到该桌面剪贴板，请勿在多用户共用同一物理桌面的场景下存放敏感临时内容。
 
 ---
 
@@ -163,6 +185,7 @@ view_desk/
 │
 ├── remote_desktop/                    # [方案 A] 原生轻量 Web 远程桌面网关
 │   ├── app.py                         # 核心 Flask 网关与会话生命周期调度
+│   ├── clipboard_bridge.py            # X11 剪贴板桥守护进程（Tk）
 │   ├── requirements.txt               # Python 依赖项
 │   ├── start.sh                       # 一键启动脚本
 │   ├── restart.sh                     # 专属平滑重启脚本

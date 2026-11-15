@@ -24,6 +24,9 @@ import threading
 import time
 import hashlib
 import secrets
+import json
+import uuid
+import atexit
 import logging
 from pathlib import Path
 from flask import (
@@ -47,6 +50,19 @@ VNC_GEOMETRY  = "1920x1080"                 # 初始分辨率（noVNC 会按浏�
 VNC_DEPTH     = "24"
 XSTARTUP      = Path(__file__).parent / "xstartup"
 SESSION_TIMEOUT = 3600                      # 会话超时 1 小时
+WEB_PORT      = int(os.environ.get("PORT", "5000"))
+
+# 剪贴板桥：x0vncserver 本身不支持 RFB 剪贴板，由同机的 Tk 守护进程
+# 直接读写 X11 CLIPBOARD，再通过 Flask API 与浏览器同步。
+CLIPBOARD_BRIDGE = Path(__file__).parent / "clipboard_bridge.py"
+CLIPBOARD_MAX_BYTES = 1_000_000
+_clipboard_proc = None
+_clipboard_env: dict = {}
+_clipboard_state_path = None
+_clipboard_request_path = None
+_clipboard_log_fh = None
+clipboard_lock = threading.RLock()
+clipboard_write_lock = threading.Lock()   # 串行化“写入远程剪贴板”请求
 
 # 运行中的会话 {username: {"vnc_display": int, "vnc_pid": int, "ws_port": int, "ws_proc": Popen}}
 active_sessions: dict = {}
@@ -75,6 +91,236 @@ def authenticate(username: str, password: str) -> bool:
     except Exception as e2:
         log.error("Shadow fallback also failed: %s", e2)
         return False
+
+# ─────────────────────────── 剪贴板桥 ───────────────────────────
+def _clipboard_dir() -> Path:
+    """所有剪贴板状态文件放在仅当前用户可访问的临时目录。"""
+    path = Path(tempfile.gettempdir()) / f"viewdesk-clipboard-{os.getuid()}"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+def _clipboard_display_key(display: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_-]", "_", display) or "0"
+
+def _close_clipboard_log():
+    global _clipboard_log_fh
+    if _clipboard_log_fh is not None:
+        try:
+            _clipboard_log_fh.close()
+        except Exception:
+            pass
+        _clipboard_log_fh = None
+
+def _pid_is_clipboard_bridge(pid: int, state_path: Path) -> bool:
+    """确认 PID 确实是使用同一状态文件的剪贴板守护进程，避免误杀。"""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    cmdline = raw.replace(b"\0", b" ").decode("utf-8", "ignore")
+    return "clipboard_bridge.py" in cmdline and str(state_path) in cmdline
+
+def _stop_stale_clipboard_bridge(state_path: Path):
+    """清理上次进程被强杀后遗留的剪贴板守护进程。"""
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    pid = state.get("pid") if isinstance(state, dict) else None
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return
+    if not _pid_is_clipboard_bridge(pid, state_path):
+        return
+
+    log.warning("Stopping stale clipboard bridge pid=%s", pid)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as e:
+        log.warning("Cannot stop stale clipboard bridge %s: %s", pid, e)
+        return
+
+    for _ in range(30):
+        if not Path(f"/proc/{pid}").exists():
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+def _start_clipboard_bridge(display: str, xauthority: str = "") -> bool:
+    """启动（或复用）X11 剪贴板守护进程。"""
+    global _clipboard_proc, _clipboard_env, _clipboard_state_path
+    global _clipboard_request_path, _clipboard_log_fh
+
+    with clipboard_lock:
+        if _clipboard_proc is not None and _clipboard_proc.poll() is None:
+            return True
+
+        base = _clipboard_dir()
+        key = _clipboard_display_key(display)
+        state_path = base / f"state-{key}.json"
+        request_path = base / f"request-{key}.json"
+
+        # 上一次服务被 SIGKILL 时守护进程可能残留，先清理，避免两个桥
+        # 同时抢占 X11 CLIPBOARD 导致版本号与内容互相覆盖。
+        _stop_stale_clipboard_bridge(state_path)
+
+        # 不要让上一次守护进程遗留的请求被重放
+        try:
+            request_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+        env = os.environ.copy()
+        env["DISPLAY"] = display
+        if xauthority:
+            env["XAUTHORITY"] = xauthority
+
+        _close_clipboard_log()
+        log_path = Path(__file__).parent / "clipboard_bridge.log"
+        try:
+            # 简单轮转，避免长期运行把日志写满磁盘
+            if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+                log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
+            pass
+        try:
+            _clipboard_log_fh = open(log_path, "ab", buffering=0)
+        except OSError:
+            _clipboard_log_fh = None
+
+        cmd = [
+            sys.executable, str(CLIPBOARD_BRIDGE),
+            "--display", display,
+            "--state", str(state_path),
+            "--request", str(request_path),
+        ]
+        log.info("Starting X11 clipboard bridge: %s", " ".join(cmd))
+        try:
+            proc = subprocess.Popen(
+                cmd, env=env,
+                stdout=_clipboard_log_fh or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception as e:
+            log.error("Failed to launch clipboard bridge: %s", e)
+            return False
+
+        _clipboard_proc = proc
+        _clipboard_env = {"display": display, "xauthority": xauthority}
+        _clipboard_state_path = state_path
+        _clipboard_request_path = request_path
+
+        # 等待“新”守护进程接管状态文件。注意不能只判断文件是否存在：
+        # 上次运行留下的状态文件会一直存在，必须核对 pid。
+        deadline = time.time() + 3.0
+        ready = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(state, dict) and state.get("pid") == proc.pid:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        if ready:
+            log.info("Clipboard bridge ready (pid=%s)", proc.pid)
+            return True
+
+        log.warning("Clipboard bridge did not become ready in time; restarting it")
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _clipboard_proc = None
+        return False
+
+def _ensure_clipboard_bridge() -> bool:
+    """桥进程意外退出时按需重启。"""
+    with clipboard_lock:
+        if _clipboard_proc is not None and _clipboard_proc.poll() is None:
+            return True
+        if not _clipboard_env:
+            return False
+        display = _clipboard_env.get("display", ":0")
+        xauthority = _clipboard_env.get("xauthority", "")
+    return _start_clipboard_bridge(display, xauthority)
+
+def _read_clipboard_state() -> dict:
+    path = _clipboard_state_path
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _write_clipboard_request(req_id: str, text: str) -> bool:
+    """原子写入剪贴板设置请求，供守护进程消费。"""
+    path = _clipboard_request_path
+    if not path:
+        return False
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        tmp.write_text(
+            json.dumps({"id": req_id, "text": text, "ts": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.error("Failed to write clipboard request: %s", e)
+        return False
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+def _stop_clipboard_bridge():
+    global _clipboard_proc
+    with clipboard_lock:
+        proc = _clipboard_proc
+        _clipboard_proc = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    _close_clipboard_log()
+
+atexit.register(_stop_clipboard_bridge)
+
+def _handle_shutdown(signum, _frame):
+    """SIGTERM/SIGINT 时先回收剪贴板守护进程。"""
+    log.info("Received signal %s, shutting down", signum)
+    _stop_clipboard_bridge()
+    raise SystemExit(0)
 
 # ─────────────────────────── VNC 管理 ───────────────────────────
 def _find_free_display() -> int:
@@ -221,7 +467,14 @@ def start_vnc_session(username: str) -> dict:
         }
         active_sessions[username] = info
         log.info("Session started for %s: display=:%d ws_port=%d", username, display, ws_port)
-        return info
+
+    # 剪贴板桥用于镜像真实桌面 :0 的 X11 剪贴板（x0vncserver 不支持 RFB 剪贴板）
+    try:
+        _start_clipboard_bridge(":0", xauth_path)
+    except Exception as e:
+        log.warning("Clipboard bridge unavailable: %s", e)
+
+    return info
 
 def stop_vnc_session(username: str):
     """停止用户的 x0vncserver + websockify 会话。"""
@@ -337,6 +590,72 @@ def novnc_static(filename):
     """
     return send_from_directory(str(NOVNC_PATH), filename)
 
+@app.route("/api/clipboard", methods=["GET"])
+def clipboard_get():
+    """返回远程 X11 剪贴板的当前版本与文本（供前端轮询）。"""
+    if "username" not in session:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _ensure_clipboard_bridge():
+        return jsonify({"error": "clipboard_bridge_unavailable"}), 503
+
+    try:
+        since = int(request.args.get("since", "-1"))
+    except (TypeError, ValueError):
+        since = -1
+
+    state = _read_clipboard_state()
+    try:
+        version = int(state.get("version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    text = state.get("text", "")
+    if not isinstance(text, str):
+        text = ""
+
+    payload = {"version": version, "changed": version != since}
+    if payload["changed"]:
+        payload["text"] = text
+    return jsonify(payload)
+
+@app.route("/api/clipboard", methods=["POST"])
+def clipboard_set():
+    """把浏览器剪贴板文本写入远程 X11 CLIPBOARD，并等待守护进程确认。"""
+    if "username" not in session:
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return jsonify({"error": "text_required"}), 400
+    if len(text.encode("utf-8")) > CLIPBOARD_MAX_BYTES:
+        return jsonify({"error": "text_too_large"}), 413
+    if not _ensure_clipboard_bridge():
+        return jsonify({"error": "clipboard_bridge_unavailable"}), 503
+
+    # 请求文件只有一个槽位，多个浏览器同时写入会互相覆盖，因此串行处理。
+    with clipboard_write_lock:
+        req_id = uuid.uuid4().hex
+        if not _write_clipboard_request(req_id, text):
+            return jsonify({"error": "request_write_failed"}), 500
+
+        # 等待守护进程真正把文本写入 X11，再返回给前端，确保随后发送的
+        # Ctrl+V 一定能粘贴到最新内容。
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            state = _read_clipboard_state()
+            if state.get("request_id") == req_id:
+                try:
+                    version = int(state.get("version", 0))
+                except (TypeError, ValueError):
+                    version = 0
+                return jsonify({"ok": True, "version": version})
+            if _clipboard_proc is not None and _clipboard_proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+    log.warning("Clipboard request %s timed out", req_id)
+    return jsonify({"error": "clipboard_timeout"}), 504
+
 @app.route("/api/keepalive", methods=["POST"])
 def keepalive():
     """前端每 60 秒调用一次，更新活跃时间。"""
@@ -363,5 +682,12 @@ threading.Thread(target=_cleanup_idle_sessions, daemon=True).start()
 
 # ─────────────────────────── 入口 ───────────────────────────
 if __name__ == "__main__":
-    # 仅监听内网，端口 5000
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    # systemd / restart.sh 使用 SIGTERM，确保子进程一起回收
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _handle_shutdown)
+        except (ValueError, OSError):
+            pass
+
+    # 仅监听内网；端口可通过 PORT 环境变量覆盖（默认 5000）
+    app.run(host="0.0.0.0", port=WEB_PORT, debug=False, threaded=True)

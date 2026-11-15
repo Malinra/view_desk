@@ -5,6 +5,7 @@
   <title>远程桌面 – {{ username }}</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html, body { width: 100%; height: 100%; overflow: hidden;
                  background: #111; font-family: system-ui, sans-serif; }
 
@@ -26,8 +27,15 @@
       font-size: 12px; font-weight: 600;
     }
     #btnFullscreen { background: #0288d1; color: #fff; }
-    #btnClipboard  { background: #37474f; color: #ccc; }
+    #btnClipboard  { background: #37474f; color: #ccc; position: relative; }
+    #btnClipboard.active,
+    #btnClipboard.has-new { background: #00897b; color: #fff; }
     #btnLogout     { background: #c62828; color: #fff; }
+    .badge {
+      display: inline-block; margin-left: 5px; padding: 0 5px;
+      min-width: 15px; border-radius: 8px; background: #ff5252; color: #fff;
+      font-size: 10px; line-height: 15px; text-align: center;
+    }
 
     /* ── 状态覆盖层 ── */
     #overlay {
@@ -64,17 +72,72 @@
       display: none;
       position: fixed; top: 44px; right: 10px; z-index: 150;
       background: #263238; border: 1px solid #37474f; border-radius: 8px;
-      padding: 10px; width: 280px;
+      padding: 10px; width: 340px; max-width: calc(100vw - 20px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
     }
-    #clipPanel textarea {
-      width: 100%; height: 80px; background: #1c262b; color: #cfd8dc;
+    #clipPanel.open { display: block; }
+    .clip-head {
+      display: flex; align-items: center; justify-content: space-between;
+      color: #cfd8dc; font-size: 13px; font-weight: 600; margin-bottom: 8px;
+    }
+    .clip-x {
+      background: none; border: none; color: #90a4ae; cursor: pointer;
+      font-size: 18px; line-height: 1; padding: 0 2px;
+    }
+    .clip-x:hover { color: #fff; }
+    .clip-hint {
+      font-size: 11px; line-height: 1.55; border-radius: 5px;
+      padding: 6px 8px; margin-bottom: 8px; color: #b0bec5;
+      background: #1c262b; border: 1px solid #37474f;
+    }
+    .clip-hint.ok { border-color: #2e7d32; color: #a5d6a7; }
+    .clip-hint.warn { border-color: #ef6c00; color: #ffcc80; }
+    #clipText {
+      width: 100%; height: 96px; background: #1c262b; color: #cfd8dc;
       border: 1px solid #455a64; border-radius: 4px; resize: vertical;
-      font-size: 13px; padding: 6px;
+      font-size: 13px; padding: 6px; font-family: inherit;
     }
-    #clipPanel .row { display: flex; gap: 6px; margin-top: 6px; }
-    #clipPanel button {
-      flex: 1; padding: 5px; background: #0288d1; color: #fff;
+    #clipText:focus { outline: 1px solid #4fc3f7; }
+    .clip-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .clip-actions button {
+      flex: 1; padding: 6px; background: #37474f; color: #eceff1;
       border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
+    }
+    .clip-actions button.primary { background: #0288d1; color: #fff; }
+    .clip-actions button:hover { filter: brightness(1.15); }
+    .clip-foot {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin-top: 8px; color: #90a4ae; font-size: 11px;
+    }
+    .clip-foot label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    .clip-status { color: #80cbc4; text-align: right; flex: 1; }
+    .clip-status.error { color: #ef9a9a; }
+
+    /* ── Toast 通知 ── */
+    #toasts {
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+      z-index: 300; display: flex; flex-direction: column; gap: 8px;
+      align-items: center; pointer-events: none; max-width: calc(100vw - 24px);
+    }
+    .toast {
+      pointer-events: auto; display: flex; align-items: center; gap: 10px;
+      background: #263238; color: #eceff1; border: 1px solid #455a64;
+      border-radius: 8px; padding: 10px 14px; font-size: 13px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+      animation: toast-in .18s ease-out;
+    }
+    .toast.error { border-color: #b71c1c; color: #ffcdd2; }
+    .toast.out { opacity: 0; transform: translateY(6px); transition: all .2s; }
+    .toast button {
+      background: #0288d1; color: #fff; border: none; border-radius: 4px;
+      padding: 4px 10px; cursor: pointer; font-size: 12px; white-space: nowrap;
+    }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+
+    /* 剪贴板捕获用的隐藏输入框：不能 display:none，否则无法获得焦点 */
+    #clipScratch {
+      position: fixed; left: -9999px; top: 0; width: 4px; height: 4px;
+      opacity: 0; border: 0; padding: 0; resize: none;
     }
   </style>
 </head>
@@ -90,22 +153,38 @@
 <!-- 顶部工具栏 -->
 <div id="topbar">
   <span class="bar-title">🖥 远程桌面 &mdash; <strong>{{ username }}</strong></span>
-  <button class="bar-btn" id="btnClipboard">📋 剪贴板</button>
+  <button class="bar-btn" id="btnClipboard" aria-expanded="false"
+          title="剪贴板同步">📋 剪贴板<span id="clipBadge" class="badge" hidden>!</span></button>
   <button class="bar-btn" id="btnFullscreen">⛶ 全屏</button>
   <a href="/logout"><button class="bar-btn" id="btnLogout">断开</button></a>
 </div>
 
 <!-- 剪贴板面板 -->
-<div id="clipPanel">
-  <textarea id="clipText" placeholder="在此粘贴文字，然后点击「发送」发送到远程桌面"></textarea>
-  <div class="row">
-    <button id="btnClipSend">发送到远程</button>
-    <button id="btnClipRecv">从远程接收</button>
+<div id="clipPanel" aria-hidden="true">
+  <div class="clip-head">
+    <span>📋 剪贴板同步</span>
+    <button class="clip-x" id="btnClipClose" title="关闭">×</button>
+  </div>
+  <div id="clipHint" class="clip-hint"></div>
+  <textarea id="clipText" spellcheck="false"
+            placeholder="远程复制的内容会显示在这里；在此粘贴文字会立即发送到远程。"></textarea>
+  <div class="clip-actions">
+    <button id="btnClipSend" class="primary">发送到远程</button>
+    <button id="btnClipCopy">复制远程内容</button>
+  </div>
+  <div class="clip-foot">
+    <label><input type="checkbox" id="clipAuto" checked> 自动同步到本机</label>
+    <span id="clipStatus" class="clip-status">就绪</span>
   </div>
 </div>
 
-<!-- noVNC 渲染区域 -->
-<div id="vnc-container"></div>
+<!-- Toast 容器 -->
+<div id="toasts" aria-live="polite"></div>
+
+<!-- noVNC 渲染区域（隐藏的剪贴板捕获框放在里面，全屏时仍可聚焦） -->
+<div id="vnc-container">
+  <textarea id="clipScratch" tabindex="-1" aria-hidden="true"></textarea>
+</div>
 
 <!-- noVNC 核心库 -->
 <script type="module">
@@ -116,8 +195,441 @@ const VNC_PASS = "{{ vnc_pass }}";
 const host     = window.location.hostname;
 const wsUrl    = `ws://${host}:${WS_PORT}/websockify`;
 
+const $ = (id) => document.getElementById(id);
+
 let rfb;
 
+const clip = {
+  // 只有 HTTPS / localhost 才能让网页自动写系统剪贴板
+  secure: !!(window.isSecureContext && navigator.clipboard &&
+             typeof navigator.clipboard.writeText === 'function'),
+  auto: localStorage.getItem('vd.clipAuto') !== '0',
+  version: -1,
+  lastRemote: '',
+  pendingRemote: '',
+  connected: false,
+  pollTimer: null,
+  pollInFlight: false,
+  capture: null,
+  bridgeErrorShown: false,
+};
+
+// ── 小工具 ────────────────────────────────────────────────
+function setStatus(message, kind = '') {
+  const el = $('clipStatus');
+  el.textContent = message;
+  el.className = 'clip-status' + (kind ? ' ' + kind : '');
+}
+
+function setBadge(show) {
+  $('clipBadge').hidden = !show;
+  $('btnClipboard').classList.toggle('has-new', !!show);
+}
+
+function toast(message, opts = {}) {
+  const wrap = $('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast' + (opts.type === 'error' ? ' error' : '');
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.appendChild(text);
+
+  let timer = null;
+  const dismiss = () => {
+    clearTimeout(timer);
+    if (!el.isConnected) return;
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 200);
+  };
+
+  if (opts.action) {
+    const btn = document.createElement('button');
+    btn.textContent = opts.action.label;
+    btn.addEventListener('click', async () => {
+      dismiss();
+      try { await opts.action.run(); } catch (e) { console.error(e); }
+    });
+    el.appendChild(btn);
+  }
+
+  wrap.appendChild(el);
+  timer = setTimeout(dismiss, opts.duration || 6000);
+  return dismiss;
+}
+
+function isEditable(el) {
+  if (!el) return false;
+  const tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+}
+
+function updateHint() {
+  const hint = $('clipHint');
+  if (clip.secure) {
+    hint.textContent = '自动模式：远程复制后本机剪贴板会自动更新；在远程窗口按 Ctrl+V，会先把本机剪贴板同步到远程再粘贴。';
+    hint.className = 'clip-hint ok';
+  } else {
+    hint.textContent = '当前是 HTTP 访问：远程复制后的几秒内通常会自动同步到本机；超时未同步则点「复制远程内容」取回。本机 Ctrl+V 不受影响。';
+    hint.className = 'clip-hint warn';
+  }
+}
+
+// ── 本机剪贴板写入 ────────────────────────────────────────
+function legacyCopy(text) {
+  const ta = $('clipScratch');
+  ta.value = text;
+  ta.focus({ preventScroll: true });
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (e) {
+    ok = false;
+  }
+  ta.value = '';
+  ta.blur();
+  if (rfb) rfb.focus({ preventScroll: true });
+  return ok;
+}
+
+async function copyTextToLocal(text) {
+  if (!text) return false;
+  if (clip.secure) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      // 权限被拒时退回到 execCommand（需要用户手势）
+    }
+  }
+  return legacyCopy(text);
+}
+
+async function copyPendingRemote() {
+  const text = clip.pendingRemote || clip.lastRemote || $('clipText').value;
+  if (!text) {
+    setStatus('远程剪贴板为空');
+    return;
+  }
+  const ok = await copyTextToLocal(text);
+  if (ok) {
+    clip.pendingRemote = '';
+    setBadge(false);
+    setStatus('远程内容已复制到本机剪贴板');
+    toast('已复制到本机剪贴板', { duration: 2500 });
+  } else {
+    setStatus('复制失败：浏览器未允许写入剪贴板', 'error');
+    toast('复制失败，请在面板中手动选择文本复制', { type: 'error' });
+  }
+  if (rfb) rfb.focus({ preventScroll: true });
+}
+
+// ── 远程剪贴板 -> 本机 ───────────────────────────────────
+async function onRemoteText(text) {
+  if (typeof text !== 'string' || text === '' || text === clip.lastRemote) return;
+  clip.lastRemote = text;
+  clip.pendingRemote = text;
+
+  if (document.activeElement !== $('clipText')) {
+    $('clipText').value = text;
+  }
+
+  if (!clip.auto) {
+    setBadge(true);
+    setStatus('远程剪贴板已更新（自动同步已关闭）');
+    return;
+  }
+
+  if (clip.secure) {
+    try {
+      await navigator.clipboard.writeText(text);
+      clip.pendingRemote = '';
+      setBadge(false);
+      setStatus('已自动同步远程内容到本机剪贴板');
+      toast('已同步远程剪贴板', { duration: 2200 });
+      return;
+    } catch (e) {
+      // 权限不足或页面失焦，降级为手动复制
+    }
+  }
+
+  // HTTP 下浏览器不允许网页随便写系统剪贴板，但在用户手势后的几秒内
+  // 仍允许 document.execCommand('copy')。远程复制通常由页面内的
+  // Ctrl+C / 鼠标菜单触发，正好可以利用这个时间窗做“准自动”同步。
+  // 若手势已过期（例如远程后台程序改了剪贴板），再降级为一键复制。
+  if (clip.auto && Date.now() - lastGestureAt < 2800 &&
+      !isEditable(document.activeElement) && legacyCopy(text)) {
+    clip.pendingRemote = '';
+    setBadge(false);
+    setStatus('已自动同步远程内容到本机剪贴板');
+    toast('已同步远程剪贴板', { duration: 2200 });
+    return;
+  }
+
+  setBadge(true);
+  setStatus('远程剪贴板已更新，点击「复制远程内容」取回');
+  toast('远程剪贴板已更新', {
+    action: { label: '复制到本机', run: copyPendingRemote },
+    duration: 8000,
+  });
+}
+
+// ── 本机剪贴板 -> 远程 ───────────────────────────────────
+async function pushToRemote(text) {
+  if (typeof text !== 'string' || text === '') {
+    setStatus('没有可发送的文本');
+    return false;
+  }
+  setStatus('正在同步到远程…');
+  try {
+    const res = await fetch('/api/clipboard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    // 不用 POST 返回的版本号直接推进 clip.version：远程桌面可能在同一
+    // 时刻又修改了剪贴板，交给下一次轮询读取真实状态更稳妥。
+    clip.lastRemote = text;
+    clip.pendingRemote = '';
+    setBadge(false);
+    setStatus(`已发送到远程剪贴板（${text.length} 字符）`);
+    return true;
+  } catch (err) {
+    const message = err.message === 'clipboard_bridge_unavailable'
+      ? '服务端剪贴板桥不可用，请检查 remote_desktop/clipboard_bridge.log'
+      : '发送到远程失败：' + err.message;
+    setStatus(message, 'error');
+    toast(message, { type: 'error' });
+    return false;
+  }
+}
+
+// ── 轮询远程剪贴板 ───────────────────────────────────────
+function schedulePoll() {
+  clearTimeout(clip.pollTimer);
+  clip.pollTimer = setTimeout(pollClipboard, 600);
+}
+
+async function pollClipboard() {
+  if (!clip.connected || document.hidden || clip.pollInFlight) {
+    schedulePoll();
+    return;
+  }
+
+  clip.pollInFlight = true;
+  try {
+    const res = await fetch(`/api/clipboard?since=${clip.version}`, { cache: 'no-store' });
+    if (res.status === 401) {
+      window.location.href = '/';
+      return;
+    }
+    if (res.status === 503) {
+      if (!clip.bridgeErrorShown) {
+        clip.bridgeErrorShown = true;
+        setStatus('服务端剪贴板桥未就绪', 'error');
+      }
+    } else if (res.ok) {
+      clip.bridgeErrorShown = false;
+      const data = await res.json();
+      // 版本号单调递增；用 > 忽略在途的旧轮询响应
+      if (typeof data.version === 'number' && data.version > clip.version) {
+        const firstSync = clip.version === -1;
+        clip.version = data.version;
+        if (typeof data.text === 'string' && data.text !== clip.lastRemote) {
+          if (firstSync) {
+            // 页面刚打开时只展示远程剪贴板，不覆盖用户本机原有内容；
+            // 之后的远程复制再自动同步。
+            clip.lastRemote = data.text;
+            clip.pendingRemote = data.text;
+            if (document.activeElement !== $('clipText')) {
+              $('clipText').value = data.text;
+            }
+            if (data.text) {
+              setBadge(true);
+              setStatus('已载入远程剪贴板，点击「复制远程内容」取回');
+            }
+          } else {
+            await onRemoteText(data.text);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // 网络抖动：下一轮继续
+  } finally {
+    clip.pollInFlight = false;
+    schedulePoll();
+  }
+}
+
+// ── Ctrl+V：先截获粘贴内容，同步到远程，再发送粘贴按键 ──
+function handlePasteKeydown(e) {
+  if (!clip.connected) return;
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  if (String(e.key || '').toLowerCase() !== 'v') return;
+  if (isEditable(e.target)) return;   // 面板输入框走浏览器原生粘贴
+  if (clip.capture) {
+    // 上一次粘贴还在同步中，吞掉重复按键，避免把旧内容立刻粘到远程
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    return;
+  }
+
+  // 阻止 noVNC 立刻把 Ctrl+V 发到远程（否则会粘贴旧内容）。
+  // 注意：不能 preventDefault，浏览器还要把内容粘贴进隐藏输入框。
+  e.stopImmediatePropagation();
+
+  const scratch = $('clipScratch');
+  scratch.value = '';
+  scratch.focus({ preventScroll: true });
+
+  const capture = { shift: !!e.shiftKey, timer: null };
+  clip.capture = capture;
+  setStatus('正在读取本机剪贴板…');
+
+  capture.timer = setTimeout(() => {
+    if (clip.capture === capture) {
+      finishPasteCapture(null, capture, true);
+    }
+  }, 250);
+}
+
+function handleScratchPaste(e) {
+  if (!clip.capture) return;
+  e.preventDefault();
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  const capture = clip.capture;
+  clearTimeout(capture.timer);
+  finishPasteCapture(text, capture, false);
+}
+
+async function finishPasteCapture(text, capture, timedOut) {
+  if (clip.capture !== capture) return;
+  clip.capture = null;
+  const shift = capture.shift;
+
+  const scratch = $('clipScratch');
+  scratch.value = '';
+  if (rfb) rfb.focus({ preventScroll: true });
+
+  if (text == null && timedOut && clip.secure) {
+    // 少数浏览器不会把 paste 事件投递给刚获得焦点的输入框，
+    // 安全上下文下还可以用异步剪贴板 API 兜底。
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      text = '';
+    }
+  }
+
+  if (text) {
+    const ok = await pushToRemote(text);
+    if (!ok) setStatus('同步失败，已直接发送粘贴快捷键', 'error');
+    else setStatus('已同步并粘贴到远程');
+  } else if (timedOut) {
+    setStatus('未读取到文本剪贴板，已发送粘贴快捷键');
+  } else {
+    setStatus('剪贴板中没有文本内容，已发送粘贴快捷键');
+  }
+
+  sendPasteChord(shift);
+}
+
+function sendPasteChord(shift) {
+  if (!rfb) return;
+  try {
+    rfb.sendKey(0xFFE3, 'ControlLeft', true);
+    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', true);
+    rfb.sendKey(0x76, 'KeyV', true);
+    rfb.sendKey(0x76, 'KeyV', false);
+    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', false);
+    rfb.sendKey(0xFFE3, 'ControlLeft', false);
+  } catch (e) {
+    console.error('sendPasteChord failed', e);
+  }
+}
+
+// ── 面板交互 ─────────────────────────────────────────────
+function openPanel() {
+  $('clipPanel').classList.add('open');
+  $('clipPanel').setAttribute('aria-hidden', 'false');
+  $('btnClipboard').classList.add('active');
+  $('btnClipboard').setAttribute('aria-expanded', 'true');
+  // 点击本身是用户手势，此时可以直接把待复制的远程内容写入剪贴板
+  if (clip.pendingRemote) copyPendingRemote();
+}
+
+function closePanel() {
+  $('clipPanel').classList.remove('open');
+  $('clipPanel').setAttribute('aria-hidden', 'true');
+  $('btnClipboard').classList.remove('active');
+  $('btnClipboard').setAttribute('aria-expanded', 'false');
+  if (rfb) rfb.focus({ preventScroll: true });
+}
+
+$('btnClipboard').addEventListener('click', () => {
+  if ($('clipPanel').classList.contains('open')) closePanel();
+  else openPanel();
+});
+$('btnClipClose').addEventListener('click', closePanel);
+
+$('btnClipSend').addEventListener('click', async () => {
+  await pushToRemote($('clipText').value);
+  if (rfb) rfb.focus({ preventScroll: true });
+});
+
+$('btnClipCopy').addEventListener('click', copyPendingRemote);
+
+$('clipAuto').checked = clip.auto;
+$('clipAuto').addEventListener('change', (e) => {
+  clip.auto = e.target.checked;
+  localStorage.setItem('vd.clipAuto', clip.auto ? '1' : '0');
+  setStatus(clip.auto ? '已开启自动同步' : '已关闭自动同步');
+  if (clip.auto && clip.pendingRemote) copyPendingRemote();
+});
+
+// 在面板里粘贴时，把内容自动同步到远程
+$('clipText').addEventListener('paste', () => {
+  setTimeout(() => {
+    const text = $('clipText').value;
+    if (text) pushToRemote(text);
+  }, 0);
+});
+
+$('clipText').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    pushToRemote($('clipText').value);
+  }
+});
+
+$('clipScratch').addEventListener('paste', handleScratchPaste);
+
+// 记录最近一次用户手势时间：HTTP 下 execCommand('copy') 只在这个窗口内有效
+let lastGestureAt = 0;
+function markUserGesture() { lastGestureAt = Date.now(); }
+window.addEventListener('pointerdown', markUserGesture, true);
+window.addEventListener('keydown', markUserGesture, true);
+window.addEventListener('touchstart', markUserGesture, true);
+
+window.addEventListener('keydown', handlePasteKeydown, true);
+
+// 页面重新获得焦点时，重试待复制的远程内容
+window.addEventListener('focus', () => {
+  // HTTP 下 focus 不算可靠的用户手势，等用户点「📋」时再复制
+  if (clip.auto && clip.pendingRemote && clip.secure) copyPendingRemote();
+  if (clip.connected) pollClipboard();
+});
+
+window.addEventListener('visibilitychange', () => {
+  if (!document.hidden && clip.connected) pollClipboard();
+});
+
+// ── noVNC 连接 ───────────────────────────────────────────
 function showError(msg) {
   document.getElementById('statusMsg').style.display = 'none';
   const e = document.getElementById('errorMsg');
@@ -137,19 +649,31 @@ function connect() {
     shared: true,
   });
 
+  rfb.addEventListener('clipboard', (e) => {
+    // noVNC 原生 RFB 剪贴板（Xvnc 等支持该特性的服务端）。
+    // 与后端轮询结果做去重，不会重复提示。
+    if (e.detail && typeof e.detail.text === 'string') {
+      onRemoteText(e.detail.text);
+    }
+  });
+
   rfb.addEventListener('connect', () => {
+    clip.connected = true;
     document.getElementById('overlay').classList.add('hidden');
+    updateHint();
+    if (rfb) rfb.focus({ preventScroll: true });
     // 自动隐藏顶栏（鼠标移近时显示）
-    setTimeout(() => {
-      document.getElementById('topbar').classList.add('hidden');
-    }, 3000);
-    // 发送当前视口尺寸
+    setTimeout(hideTopbar, 3000);
     sendViewportSize();
+    // 立即获取一次当前远程剪贴板，然后开始轮询
+    pollClipboard();
     // 保持会话活跃
-    setInterval(() => fetch('/api/keepalive', {method:'POST'}), 60000);
+    setInterval(() => fetch('/api/keepalive', { method: 'POST' }), 60000);
   });
 
   rfb.addEventListener('disconnect', (e) => {
+    clip.connected = false;
+    clearTimeout(clip.pollTimer);
     document.getElementById('overlay').classList.remove('hidden');
     if (e.detail.clean) {
       showError('桌面会话已断开');
@@ -166,7 +690,6 @@ function connect() {
 // 通知 noVNC 视口大小改变（实现自适应分辨率）
 function sendViewportSize() {
   if (!rfb) return;
-  const container = document.getElementById('vnc-container');
   rfb.scaleViewport = true;
   rfb.resizeSession = true;
 }
@@ -183,30 +706,30 @@ document.getElementById('btnFullscreen').addEventListener('click', () => {
   }
 });
 
-// ── 剪贴板面板 ──
-document.getElementById('btnClipboard').addEventListener('click', () => {
-  const p = document.getElementById('clipPanel');
-  p.style.display = p.style.display === 'block' ? 'none' : 'block';
-});
-document.getElementById('btnClipSend').addEventListener('click', () => {
-  const text = document.getElementById('clipText').value;
-  if (rfb && text) rfb.clipboardPasteFrom(text);
-});
-document.getElementById('btnClipRecv').addEventListener('click', () => {
-  // noVNC 触发 clipboard 事件时填充
-  if (rfb) rfb.addEventListener('clipboard', (e) => {
-    document.getElementById('clipText').value = e.detail.text;
-  });
+document.addEventListener('fullscreenchange', () => {
+  if (rfb) rfb.focus({ preventScroll: true });
 });
 
-// 自动隐藏顶栏：靠近屏幕顶部时显示
+// ── 顶栏自动隐藏 ──
+let hideTimer = null;
+function hideTopbar() {
+  if ($('clipPanel').classList.contains('open')) return;
+  $('topbar').classList.add('hidden');
+}
 document.addEventListener('mousemove', (e) => {
-  const bar = document.getElementById('topbar');
-  if (e.clientY < 50) bar.classList.remove('hidden');
-  else setTimeout(() => bar.classList.add('hidden'), 2000);
+  const bar = $('topbar');
+  if (e.clientY < 50 || $('clipPanel').classList.contains('open')) {
+    bar.classList.remove('hidden');
+    clearTimeout(hideTimer);
+  } else {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hideTopbar, 2000);
+  }
 });
 
-// 开始连接
+// 初始化
+updateHint();
+setStatus('就绪');
 connect();
 </script>
 </body>
