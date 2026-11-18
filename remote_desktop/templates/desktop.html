@@ -136,8 +136,11 @@
 
     /* 剪贴板捕获用的隐藏输入框：不能 display:none，否则无法获得焦点 */
     #clipScratch {
-      position: fixed; left: -9999px; top: 0; width: 4px; height: 4px;
-      opacity: 0; border: 0; padding: 0; resize: none;
+      /* macOS/Safari 对“不可见/屏幕外”的输入框会拒绝粘贴，这里保留 2px
+         的可见区域并把透明度压到接近 0，既不影响观感又能可靠接收 paste。 */
+      position: fixed; left: 0; top: 0; width: 2px; height: 2px;
+      opacity: 0.01; border: 0; padding: 0; resize: none;
+      z-index: -1; pointer-events: none;
     }
   </style>
 </head>
@@ -197,6 +200,9 @@ const wsUrl    = `ws://${host}:${WS_PORT}/websockify`;
 
 const $ = (id) => document.getElementById(id);
 
+const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || '') ||
+              (navigator.userAgentData && navigator.userAgentData.platform === 'macOS');
+
 let rfb;
 
 const clip = {
@@ -208,8 +214,9 @@ const clip = {
   lastRemote: '',
   pendingRemote: '',
   connected: false,
-  pollTimer: null,
-  pollInFlight: false,
+  loopRunning: false,
+  lastPushed: null,     // { text, at }：最近一次由本机推送到远程的文本
+  lastGestureAt: 0,     // 最近一次用户手势时间（HTTP 下 execCommand('copy') 依赖它）
   capture: null,
   bridgeErrorShown: false,
 };
@@ -265,17 +272,42 @@ function isEditable(el) {
 
 function updateHint() {
   const hint = $('clipHint');
+  const pasteKey = isMac ? 'Cmd+V' : 'Ctrl+V';
+  const copyKey = isMac ? 'Cmd+C' : 'Ctrl+C';
   if (clip.secure) {
-    hint.textContent = '自动模式：远程复制后本机剪贴板会自动更新；在远程窗口按 Ctrl+V，会先把本机剪贴板同步到远程再粘贴。';
+    hint.textContent = `自动模式：远程复制后本机剪贴板会自动更新；在远程窗口按 ${pasteKey} 粘贴。远程复制使用 ${copyKey}（终端用 ${isMac ? 'Cmd+Shift+C' : 'Ctrl+Shift+C'}）。`;
     hint.className = 'clip-hint ok';
   } else {
-    hint.textContent = '当前是 HTTP 访问：远程复制后的几秒内通常会自动同步到本机；超时未同步则点「复制远程内容」取回。本机 Ctrl+V 不受影响。';
+    hint.textContent = `当前是 HTTP 访问：在远程窗口按 ${copyKey} 复制后通常会立即同步到本机；若浏览器拒绝（如远程程序自行修改剪贴板），点「复制远程内容」取回。本机 ${pasteKey} 会先同步到远程再粘贴。改用 HTTPS 可获得完全自动的同步。`;
     hint.className = 'clip-hint warn';
   }
 }
 
 // ── 本机剪贴板写入 ────────────────────────────────────────
+// HTTP 页面没有 navigator.clipboard，只能用 execCommand('copy')，且必须在
+// 用户手势后的短时间内（Chrome/Firefox 约 5 秒）调用。优先通过 copy 事件
+// 写入数据：不需要移动焦点，不会打断 noVNC 的键盘状态。
 function legacyCopy(text) {
+  let handled = false;
+  const onCopy = (e) => {
+    if (!e.clipboardData) return;
+    e.clipboardData.setData('text/plain', text);
+    e.preventDefault();
+    handled = true;
+  };
+  document.addEventListener('copy', onCopy, true);
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (e) {
+    ok = false;
+  }
+  document.removeEventListener('copy', onCopy, true);
+  if (ok && handled) return true;
+  return legacySelectCopy(text);
+}
+
+function legacySelectCopy(text) {
   const ta = $('clipScratch');
   ta.value = text;
   ta.focus({ preventScroll: true });
@@ -324,9 +356,16 @@ async function copyPendingRemote() {
   if (rfb) rfb.focus({ preventScroll: true });
 }
 
+function inGestureWindow() {
+  return Date.now() - clip.lastGestureAt < 4500;
+}
+
 // ── 远程剪贴板 -> 本机 ───────────────────────────────────
-async function onRemoteText(text) {
-  if (typeof text !== 'string' || text === '' || text === clip.lastRemote) return;
+// force=true：服务端版本号变化即代表远程发生了一次复制，即使文本与上次相同
+// 也要重新写入本机（期间本机可能复制过别的内容）。
+async function onRemoteText(text, force = false) {
+  if (typeof text !== 'string' || text === '') return;
+  if (!force && text === clip.lastRemote) return;
   clip.lastRemote = text;
   clip.pendingRemote = text;
 
@@ -349,15 +388,13 @@ async function onRemoteText(text) {
       toast('已同步远程剪贴板', { duration: 2200 });
       return;
     } catch (e) {
-      // 权限不足或页面失焦，降级为手动复制
+      // 权限不足或页面失焦，再尝试 execCommand，最后降级为手动复制
     }
   }
 
-  // HTTP 下浏览器不允许网页随便写系统剪贴板，但在用户手势后的几秒内
-  // 仍允许 document.execCommand('copy')。远程复制通常由页面内的
-  // Ctrl+C / 鼠标菜单触发，正好可以利用这个时间窗做“准自动”同步。
-  // 若手势已过期（例如远程后台程序改了剪贴板），再降级为一键复制。
-  if (clip.auto && Date.now() - lastGestureAt < 2800 &&
+  // 远程复制通常由页面内的 Ctrl/Cmd+C 或鼠标菜单触发，此时仍处于用户手势
+  // 有效期内，可直接用 execCommand('copy') 写入本机剪贴板（HTTP 也可用）。
+  if (inGestureWindow() && document.hasFocus() &&
       !isEditable(document.activeElement) && legacyCopy(text)) {
     clip.pendingRemote = '';
     setBadge(false);
@@ -381,6 +418,8 @@ async function pushToRemote(text) {
     return false;
   }
   setStatus('正在同步到远程…');
+  // 先登记，避免长轮询先于 POST 响应拿到这次写入，被误当成“远程复制”回写本机
+  clip.lastPushed = { text, at: Date.now() };
   try {
     const res = await fetch('/api/clipboard', {
       method: 'POST',
@@ -394,6 +433,7 @@ async function pushToRemote(text) {
     // 不用 POST 返回的版本号直接推进 clip.version：远程桌面可能在同一
     // 时刻又修改了剪贴板，交给下一次轮询读取真实状态更稳妥。
     clip.lastRemote = text;
+    clip.lastPushed = { text, at: Date.now() };
     clip.pendingRemote = '';
     setBadge(false);
     setStatus(`已发送到远程剪贴板（${text.length} 字符）`);
@@ -408,70 +448,151 @@ async function pushToRemote(text) {
   }
 }
 
-// ── 轮询远程剪贴板 ───────────────────────────────────────
-function schedulePoll() {
-  clearTimeout(clip.pollTimer);
-  clip.pollTimer = setTimeout(pollClipboard, 600);
+// ── 长轮询远程剪贴板 ─────────────────────────────────────
+// 服务端在版本号变化前挂起请求（最多 20 秒），远程一复制就立即返回。
+// 只运行一个循环，避免重复轮询。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isOwnEcho(text) {
+  return !!clip.lastPushed && clip.lastPushed.text === text &&
+         Date.now() - clip.lastPushed.at < 5000;
 }
 
-async function pollClipboard() {
-  if (!clip.connected || document.hidden || clip.pollInFlight) {
-    schedulePoll();
+async function clipboardLoop() {
+  if (clip.loopRunning) return;
+  clip.loopRunning = true;
+  let failures = 0;
+  try {
+    while (clip.connected) {
+      let ok = false;
+      try {
+        const wait = clip.version === -1 ? 0 : 20;
+        const res = await fetch(`/api/clipboard?since=${clip.version}&wait=${wait}`,
+                                { cache: 'no-store' });
+        if (res.status === 401) {
+          window.location.href = '/';
+          return;
+        }
+        if (res.status === 503) {
+          if (!clip.bridgeErrorShown) {
+            clip.bridgeErrorShown = true;
+            setStatus('服务端剪贴板桥未就绪', 'error');
+          }
+        } else if (res.ok) {
+          ok = true;
+          clip.bridgeErrorShown = false;
+          await handleClipboardState(await res.json());
+        }
+      } catch (e) {
+        // 网络抖动：退避后继续
+      }
+      failures = ok ? 0 : failures + 1;
+      if (failures) await sleep(Math.min(500 * failures, 5000));
+    }
+  } finally {
+    clip.loopRunning = false;
+  }
+}
+
+async function handleClipboardState(data) {
+  // 用 !== 而不是 >：剪贴板桥状态被清理后版本号可能回到较小值
+  if (typeof data.version !== 'number' || data.version === clip.version) return;
+  const firstSync = clip.version === -1;
+  clip.version = data.version;
+  if (typeof data.text !== 'string' || data.text === '') return;
+
+  if (firstSync) {
+    // 页面刚打开时只展示远程剪贴板，不覆盖用户本机原有内容；
+    // 之后的远程复制再自动同步。
+    clip.lastRemote = data.text;
+    clip.pendingRemote = data.text;
+    if (document.activeElement !== $('clipText')) {
+      $('clipText').value = data.text;
+    }
+    setBadge(true);
+    setStatus('已载入远程剪贴板，点击「复制远程内容」取回');
+    return;
+  }
+  if (isOwnEcho(data.text)) {
+    // 本机刚推送到远程的内容，本机剪贴板里已经是它了
+    clip.lastRemote = data.text;
+    return;
+  }
+  await onRemoteText(data.text, true);
+}
+
+// ── 远程按键状态 ─────────────────────────────────────────
+// noVNC 在修饰键按下时就已把它发给远程（macOS 的 Cmd 会被映射成 Alt）。
+// 我们改发 Ctrl+C / Ctrl+V 之前必须先松开这些修饰键，否则远程收到的是
+// Alt+Ctrl+V 之类的组合，粘贴/复制不生效。
+const MODIFIER_CODE = /^(Control|Shift|Alt|Meta|OS)(Left|Right)$|^AltGraph$/;
+
+function remoteKeyboard() {
+  return rfb && rfb._keyboard && rfb._keyboard._keyDownList ? rfb._keyboard : null;
+}
+
+function releaseRemoteModifiers() {
+  const kb = remoteKeyboard();
+  if (!kb) return;
+  if (kb._altGrArmed) {
+    // Windows 上 Ctrl 会被延迟 100ms 发送（AltGr 检测），取消它以免之后卡住
+    kb._altGrArmed = false;
+    clearTimeout(kb._altGrTimeout);
+  }
+  for (const code of Object.keys(kb._keyDownList)) {
+    if (MODIFIER_CODE.test(code)) kb._sendKeyEvent(kb._keyDownList[code], code, false);
+  }
+}
+
+// 粘贴时焦点会临时移到隐藏输入框，松键事件不再经过 noVNC 的 canvas，
+// 远程会一直以为该键按着。这里替 noVNC 补发松键。
+function handleStrayKeyup(e) {
+  const kb = remoteKeyboard();
+  if (!kb || e.target === rfb._canvas) return;
+  const code = e.code;
+  if (code && code in kb._keyDownList) kb._sendKeyEvent(kb._keyDownList[code], code, false);
+}
+
+// macOS 客户端的 Cmd+C 是本机习惯；远程 Linux/X11 应用使用 Ctrl+C。
+// 映射标准复制组合，同时保留 Shift（例如终端的 Cmd+Shift+C）。
+function sendRemoteCtrlChord(keysym, code, shift = false) {
+  if (!rfb) return;
+  releaseRemoteModifiers();
+  try {
+    rfb.sendKey(0xFFE3, 'ControlLeft', true);
+    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', true);
+    rfb.sendKey(keysym, code, true);
+    rfb.sendKey(keysym, code, false);
+    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', false);
+    rfb.sendKey(0xFFE3, 'ControlLeft', false);
+  } catch (e) {
+    console.error('sendRemoteCtrlChord failed', e);
+  }
+}
+
+// ── 客户端原生粘贴快捷键：读取本机剪贴板，再粘贴到远程 ──
+function handlePasteKeydown(e) {
+  if (!clip.connected) return;
+  if (isEditable(e.target)) return;   // 面板输入框走浏览器原生剪贴板操作
+  const key = String(e.key || '').toLowerCase();
+
+  // 浏览器使用客户端操作系统的快捷键；非本机惯例组合不拦截，直接交给 noVNC。
+  // macOS 的 Cmd+C / Cmd+X 映射成远程 Linux 的 Ctrl+C / Ctrl+X。
+  if (isMac && e.metaKey && !e.ctrlKey && !e.altKey && (key === 'c' || key === 'x')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (key === 'c') sendRemoteCtrlChord(0x63, 'KeyC', !!e.shiftKey);
+    else sendRemoteCtrlChord(0x78, 'KeyX', !!e.shiftKey);
     return;
   }
 
-  clip.pollInFlight = true;
-  try {
-    const res = await fetch(`/api/clipboard?since=${clip.version}`, { cache: 'no-store' });
-    if (res.status === 401) {
-      window.location.href = '/';
-      return;
-    }
-    if (res.status === 503) {
-      if (!clip.bridgeErrorShown) {
-        clip.bridgeErrorShown = true;
-        setStatus('服务端剪贴板桥未就绪', 'error');
-      }
-    } else if (res.ok) {
-      clip.bridgeErrorShown = false;
-      const data = await res.json();
-      // 版本号单调递增；用 > 忽略在途的旧轮询响应
-      if (typeof data.version === 'number' && data.version > clip.version) {
-        const firstSync = clip.version === -1;
-        clip.version = data.version;
-        if (typeof data.text === 'string' && data.text !== clip.lastRemote) {
-          if (firstSync) {
-            // 页面刚打开时只展示远程剪贴板，不覆盖用户本机原有内容；
-            // 之后的远程复制再自动同步。
-            clip.lastRemote = data.text;
-            clip.pendingRemote = data.text;
-            if (document.activeElement !== $('clipText')) {
-              $('clipText').value = data.text;
-            }
-            if (data.text) {
-              setBadge(true);
-              setStatus('已载入远程剪贴板，点击「复制远程内容」取回');
-            }
-          } else {
-            await onRemoteText(data.text);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    // 网络抖动：下一轮继续
-  } finally {
-    clip.pollInFlight = false;
-    schedulePoll();
-  }
-}
+  const nativePaste = isMac
+    ? e.metaKey && !e.ctrlKey
+    : e.ctrlKey && !e.metaKey;
+  if (!nativePaste || e.altKey || key !== 'v') return;
 
-// ── Ctrl+V：先截获粘贴内容，同步到远程，再发送粘贴按键 ──
-function handlePasteKeydown(e) {
-  if (!clip.connected) return;
-  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-  if (String(e.key || '').toLowerCase() !== 'v') return;
-  if (isEditable(e.target)) return;   // 面板输入框走浏览器原生粘贴
+  // noVNC 会把按键转发到远程系统；稍后根据远程 Linux/X11 环境发送
+  // Ctrl+V，终端组合则保留 Shift。此处不 preventDefault，保留浏览器 paste 事件。
   if (clip.capture) {
     // 上一次粘贴还在同步中，吞掉重复按键，避免把旧内容立刻粘到远程
     e.preventDefault();
@@ -479,15 +600,28 @@ function handlePasteKeydown(e) {
     return;
   }
 
-  // 阻止 noVNC 立刻把 Ctrl+V 发到远程（否则会粘贴旧内容）。
-  // 注意：不能 preventDefault，浏览器还要把内容粘贴进隐藏输入框。
+  // 阻止 noVNC 立刻把粘贴快捷键发到远程（否则会粘贴旧内容）。
+  // 不 preventDefault，让浏览器仍生成原生 paste 事件。
   e.stopImmediatePropagation();
 
+  // 将焦点交给可接收 paste 的捕获框；document 捕获监听器同时兜底浏览器
+  // 把 paste 事件发到 canvas/body 的情况。HTTP 页面只能通过该事件读剪贴板。
   const scratch = $('clipScratch');
   scratch.value = '';
   scratch.focus({ preventScroll: true });
 
-  const capture = { shift: !!e.shiftKey, timer: null };
+  // Clipboard API 的读取必须在真实用户手势期间发起；等到 paste 超时后再调用，
+  // 在部分浏览器里用户激活已经失效。HTTP 页面不支持该 API，仍由 paste 事件兜底。
+  let readPromise = null;
+  if (clip.secure) {
+    try {
+      readPromise = navigator.clipboard.readText().catch(() => '');
+    } catch (e) {
+      readPromise = Promise.resolve('');
+    }
+  }
+
+  const capture = { shift: !!e.shiftKey, timer: null, readPromise };
   clip.capture = capture;
   setStatus('正在读取本机剪贴板…');
 
@@ -507,6 +641,18 @@ function handleScratchPaste(e) {
   finishPasteCapture(text, capture, false);
 }
 
+// macOS/Safari 不一定把 Cmd+V 的 paste 事件重新定位到我们刚聚焦的隐藏输入框；
+// 此时 paste 会落在原来的 canvas/body 上。在 document 捕获阶段兜底读取。
+function handleDocumentPaste(e) {
+  if (!clip.capture) return;
+  if (isEditable(e.target)) return;   // 面板输入框交给它自己的 paste 处理
+  e.preventDefault();
+  const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  const capture = clip.capture;
+  clearTimeout(capture.timer);
+  finishPasteCapture(text, capture, false);
+}
+
 async function finishPasteCapture(text, capture, timedOut) {
   if (clip.capture !== capture) return;
   clip.capture = null;
@@ -516,41 +662,37 @@ async function finishPasteCapture(text, capture, timedOut) {
   scratch.value = '';
   if (rfb) rfb.focus({ preventScroll: true });
 
-  if (text == null && timedOut && clip.secure) {
-    // 少数浏览器不会把 paste 事件投递给刚获得焦点的输入框，
-    // 安全上下文下还可以用异步剪贴板 API 兜底。
+  if (!text && capture.readPromise) {
+    // 优先使用按键时已启动的读取请求：部分浏览器不会把 paste 事件
+    // 投递到隐藏输入框，或会在 paste 事件中不给 clipboardData 文本。
     try {
-      text = await navigator.clipboard.readText();
+      text = await capture.readPromise;
     } catch (e) {
       text = '';
     }
   }
 
+  let canPaste = false;
   if (text) {
-    const ok = await pushToRemote(text);
-    if (!ok) setStatus('同步失败，已直接发送粘贴快捷键', 'error');
-    else setStatus('已同步并粘贴到远程');
+    canPaste = await pushToRemote(text);
+    if (canPaste) setStatus('已同步并粘贴到远程');
   } else if (timedOut) {
-    setStatus('未读取到文本剪贴板，已发送粘贴快捷键');
+    setStatus('未读取到本机剪贴板，未向远程发送粘贴键', 'error');
+    toast(isMac
+      ? '未能读取本机剪贴板：请检查浏览器剪贴板权限，或打开「📋」面板，在文本框中按 Cmd+V 后发送'
+      : '未能读取本机剪贴板：请检查浏览器剪贴板权限，或打开「📋」面板，在文本框中粘贴后发送', {
+      type: 'error', duration: 8000,
+    });
   } else {
-    setStatus('剪贴板中没有文本内容，已发送粘贴快捷键');
+    setStatus('剪贴板中没有可粘贴的文本', 'error');
   }
 
-  sendPasteChord(shift);
+  // 只有确认远程 CLIPBOARD 已更新后才发送按键，避免失败时误粘贴旧内容。
+  if (canPaste) sendPasteChord(shift);
 }
 
 function sendPasteChord(shift) {
-  if (!rfb) return;
-  try {
-    rfb.sendKey(0xFFE3, 'ControlLeft', true);
-    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', true);
-    rfb.sendKey(0x76, 'KeyV', true);
-    rfb.sendKey(0x76, 'KeyV', false);
-    if (shift) rfb.sendKey(0xFFE1, 'ShiftLeft', false);
-    rfb.sendKey(0xFFE3, 'ControlLeft', false);
-  } catch (e) {
-    console.error('sendPasteChord failed', e);
-  }
+  sendRemoteCtrlChord(0x76, 'KeyV', shift);
 }
 
 // ── 面板交互 ─────────────────────────────────────────────
@@ -608,25 +750,21 @@ $('clipText').addEventListener('keydown', (e) => {
 });
 
 $('clipScratch').addEventListener('paste', handleScratchPaste);
+document.addEventListener('paste', handleDocumentPaste, true);
 
-// 记录最近一次用户手势时间：HTTP 下 execCommand('copy') 只在这个窗口内有效
-let lastGestureAt = 0;
-function markUserGesture() { lastGestureAt = Date.now(); }
+// 必须先于 handlePasteKeydown 注册：后者会 stopImmediatePropagation
+function markUserGesture() { clip.lastGestureAt = Date.now(); }
 window.addEventListener('pointerdown', markUserGesture, true);
 window.addEventListener('keydown', markUserGesture, true);
 window.addEventListener('touchstart', markUserGesture, true);
 
 window.addEventListener('keydown', handlePasteKeydown, true);
+window.addEventListener('keyup', handleStrayKeyup, true);
 
-// 页面重新获得焦点时，重试待复制的远程内容
+// 页面重新获得焦点时，重试待复制的远程内容（远程复制后立刻切走时会出现）
 window.addEventListener('focus', () => {
   // HTTP 下 focus 不算可靠的用户手势，等用户点「📋」时再复制
   if (clip.auto && clip.pendingRemote && clip.secure) copyPendingRemote();
-  if (clip.connected) pollClipboard();
-});
-
-window.addEventListener('visibilitychange', () => {
-  if (!document.hidden && clip.connected) pollClipboard();
 });
 
 // ── noVNC 连接 ───────────────────────────────────────────
@@ -665,15 +803,14 @@ function connect() {
     // 自动隐藏顶栏（鼠标移近时显示）
     setTimeout(hideTopbar, 3000);
     sendViewportSize();
-    // 立即获取一次当前远程剪贴板，然后开始轮询
-    pollClipboard();
+    // 立即获取一次当前远程剪贴板，然后开始长轮询
+    clipboardLoop();
     // 保持会话活跃
     setInterval(() => fetch('/api/keepalive', { method: 'POST' }), 60000);
   });
 
   rfb.addEventListener('disconnect', (e) => {
     clip.connected = false;
-    clearTimeout(clip.pollTimer);
     document.getElementById('overlay').classList.remove('hidden');
     if (e.detail.clean) {
       showError('桌面会话已断开');

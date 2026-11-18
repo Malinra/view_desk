@@ -27,6 +27,8 @@ readable by the user running the web gateway.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
 import signal
@@ -35,7 +37,8 @@ import time
 from pathlib import Path
 
 MAX_TEXT_CHARS = 1_000_000
-POLL_MS_DEFAULT = 250
+POLL_MS_DEFAULT = 40          # request file / XFixes event check interval
+TEXT_POLL_MS_FALLBACK = 250   # text-compare polling when XFixes is unavailable
 
 
 def log(message: str) -> None:
@@ -57,13 +60,95 @@ def atomic_write_json(path: Path, data: dict) -> None:
             pass
 
 
+class XFixesWatcher:
+    """Report every CLIPBOARD ownership change via the XFixes extension.
+
+    Text comparison alone misses a remote re-copy of the *same* text (e.g. the
+    user copies A remotely, copies B locally, then copies A remotely again: the
+    X clipboard text never changed, so nothing would be synced).  XFixes emits
+    an event on every SetSelectionOwner, so each copy is seen.  It also means
+    the clipboard text is only fetched when something actually changed.
+    """
+
+    class _SelectionNotify(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int),
+            ("serial", ctypes.c_ulong),
+            ("send_event", ctypes.c_int),
+            ("display", ctypes.c_void_p),
+            ("window", ctypes.c_ulong),
+            ("subtype", ctypes.c_int),
+            ("owner", ctypes.c_ulong),
+            ("selection", ctypes.c_ulong),
+            ("timestamp", ctypes.c_ulong),
+            ("selection_timestamp", ctypes.c_ulong),
+        ]
+
+    class _XEvent(ctypes.Union):
+        _fields_ = [("type", ctypes.c_int), ("pad", ctypes.c_long * 24)]
+
+    def __init__(self, display: str) -> None:
+        x11_name = ctypes.util.find_library("X11") or "libX11.so.6"
+        xfixes_name = ctypes.util.find_library("Xfixes") or "libXfixes.so.3"
+        self.x11 = ctypes.CDLL(x11_name)
+        self.xfixes = ctypes.CDLL(xfixes_name)
+
+        x11, xfixes = self.x11, self.xfixes
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XGetSelectionOwner.restype = ctypes.c_ulong
+        x11.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XPending.argtypes = [ctypes.c_void_p]
+        x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        xfixes.XFixesQueryExtension.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        xfixes.XFixesSelectSelectionInput.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+
+        self.dpy = x11.XOpenDisplay(display.encode())
+        if not self.dpy:
+            raise RuntimeError(f"XOpenDisplay({display}) failed")
+        event_base, error_base = ctypes.c_int(), ctypes.c_int()
+        if not xfixes.XFixesQueryExtension(self.dpy, ctypes.byref(event_base),
+                                           ctypes.byref(error_base)):
+            x11.XCloseDisplay(self.dpy)
+            raise RuntimeError("XFixes extension not available")
+        self.notify_type = event_base.value  # + XFixesSelectionNotify (0)
+        self.atom = x11.XInternAtom(self.dpy, b"CLIPBOARD", 0)
+        # XFixesSetSelectionOwnerNotifyMask = 1
+        xfixes.XFixesSelectSelectionInput(
+            self.dpy, x11.XDefaultRootWindow(self.dpy), self.atom, 1)
+        x11.XFlush(self.dpy)
+        self._event = self._XEvent()
+
+    def current_owner(self) -> int:
+        return int(self.x11.XGetSelectionOwner(self.dpy, self.atom))
+
+    def drain(self) -> list[int]:
+        """Return the owner window of every ownership change since last call."""
+        owners = []
+        while self.x11.XPending(self.dpy) > 0:
+            self.x11.XNextEvent(self.dpy, ctypes.byref(self._event))
+            if self._event.type == self.notify_type:
+                ev = ctypes.cast(ctypes.byref(self._event),
+                                 ctypes.POINTER(self._SelectionNotify)).contents
+                owners.append(int(ev.owner))
+        return owners
+
+
 class ClipboardBridge:
     def __init__(self, display: str, state_path: Path, request_path: Path,
                  poll_ms: int = POLL_MS_DEFAULT) -> None:
         self.display = display
         self.state_path = state_path
         self.request_path = request_path
-        self.poll_ms = max(100, poll_ms)
+        self.poll_ms = max(20, poll_ms)
 
         self.root = None
         self.text = ""
@@ -71,6 +156,10 @@ class ClipboardBridge:
         self.last_request_id = None
         self.last_applied_text = None
         self._lock_handle = None
+        self.watcher: XFixesWatcher | None = None
+        self.own_owner = 0          # X window Tk uses to own CLIPBOARD
+        self._request_sig = None    # (mtime_ns, size, inode) of request file
+        self._last_text_poll = 0.0
 
     # ── Tk clipboard helpers ────────────────────────────────────────────
     def _read_x_clipboard(self) -> str | None:
@@ -89,6 +178,12 @@ class ClipboardBridge:
         # Process the selection hand-over right away.  update() is used instead
         # of update_idletasks() because selection ownership is an X event.
         self.root.update()
+        if self.watcher is not None:
+            # Tk's `update` syncs with the server, so the owner is ours now.
+            # Remember Tk's clipboard window to ignore the echo of our writes.
+            owner = self.watcher.current_owner()
+            if owner:
+                self.own_owner = owner
 
     # ── state file ──────────────────────────────────────────────────────
     def _publish(self) -> None:
@@ -99,6 +194,20 @@ class ClipboardBridge:
             "pid": os.getpid(),
             "updated": time.time(),
         })
+
+    def _request_changed(self) -> bool:
+        """Cheap stat() check so the request file is only parsed when written."""
+        try:
+            st = self.request_path.stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if sig == self._request_sig:
+            return False
+        self._request_sig = sig
+        return True
 
     def _read_request(self) -> tuple[str, str] | None:
         try:
@@ -136,6 +245,8 @@ class ClipboardBridge:
                 self.root.after(self.poll_ms, self._tick)
 
     def _process_request(self) -> None:
+        if not self._request_changed():
+            return
         request = self._read_request()
         if not request:
             return
@@ -155,6 +266,13 @@ class ClipboardBridge:
         log(f"applied clipboard request {req_id[:8]} ({len(text)} chars)")
 
     def _detect_external_change(self) -> None:
+        if self.watcher is not None:
+            self._detect_via_xfixes()
+            return
+        now = time.monotonic()
+        if (now - self._last_text_poll) * 1000 < TEXT_POLL_MS_FALLBACK:
+            return
+        self._last_text_poll = now
         current = self._read_x_clipboard()
         if current is None:
             return
@@ -169,6 +287,28 @@ class ClipboardBridge:
         self.version += 1
         self._publish()
         log(f"remote clipboard changed ({len(current)} chars), version={self.version}")
+
+    def _detect_via_xfixes(self) -> None:
+        try:
+            owners = self.watcher.drain()
+        except Exception as exc:
+            log(f"XFixes watcher failed, falling back to polling: {exc!r}")
+            self.watcher = None
+            return
+        # Only a new foreign owner means "the user copied something remotely".
+        # owner == 0: the owning app exited; own_owner: echo of our own write.
+        foreign = [o for o in owners if o and o != self.own_owner]
+        if not foreign:
+            return
+        current = self._read_x_clipboard()
+        if current is None or current == "":
+            return
+        # Bump the version even when the text is unchanged: the user copied
+        # again and expects the local clipboard to receive it again.
+        self.text = current
+        self.version += 1
+        self._publish()
+        log(f"remote clipboard copied ({len(current)} chars), version={self.version}")
 
     def _acquire_lock(self):
         """保证同一块 X display 只有一个剪贴板守护进程。"""
@@ -215,7 +355,15 @@ class ClipboardBridge:
             log(f"cannot open X display {self.display}: {exc!r}")
             return 3
 
+        try:
+            self.watcher = XFixesWatcher(self.display)
+            log("using XFixes selection events")
+        except Exception as exc:
+            self.watcher = None
+            log(f"XFixes unavailable ({exc!r}); polling clipboard text instead")
+
         # Do not apply a request left over from a previous daemon instance.
+        self._request_changed()
         existing = self._read_request()
         if existing:
             self.last_request_id = existing[0]

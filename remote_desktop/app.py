@@ -603,11 +603,41 @@ def clipboard_get():
     except (TypeError, ValueError):
         since = -1
 
-    state = _read_clipboard_state()
+    # 长轮询：带 wait 参数时，在版本号变化前挂起最多 wait 秒。远程一复制，
+    # 浏览器就能在几十毫秒内拿到新内容，而不是等下一轮定时轮询。
     try:
-        version = int(state.get("version", 0))
+        wait = min(max(float(request.args.get("wait", "0")), 0.0), 25.0)
     except (TypeError, ValueError):
-        version = 0
+        wait = 0.0
+
+    def _version_of(st: dict) -> int:
+        try:
+            return int(st.get("version", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    state = _read_clipboard_state()
+    version = _version_of(state)
+    if wait and version == since:
+        deadline = time.time() + wait
+        path = _clipboard_state_path
+        last_sig = None
+        while time.time() < deadline:
+            time.sleep(0.03)
+            try:
+                st = path.stat()
+                sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+            except OSError:
+                sig = None
+            if sig == last_sig:
+                continue
+            last_sig = sig
+            state = _read_clipboard_state()
+            version = _version_of(state)
+            if version != since:
+                break
+            if _clipboard_proc is not None and _clipboard_proc.poll() is not None:
+                break
     text = state.get("text", "")
     if not isinstance(text, str):
         text = ""
@@ -651,7 +681,7 @@ def clipboard_set():
                 return jsonify({"ok": True, "version": version})
             if _clipboard_proc is not None and _clipboard_proc.poll() is not None:
                 break
-            time.sleep(0.05)
+            time.sleep(0.01)
 
     log.warning("Clipboard request %s timed out", req_id)
     return jsonify({"error": "clipboard_timeout"}), 504
